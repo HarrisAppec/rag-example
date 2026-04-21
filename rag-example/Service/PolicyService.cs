@@ -1,34 +1,25 @@
 using Microsoft.Data.Sqlite;
-using OpenAI;
-using OpenAI.Chat;
-using OpenAI.Embeddings;
+using OllamaSharp;
+using OllamaSharp.Models;
 
 namespace rag_example.Service;
 
 public class PolicyService
 {
-    private readonly ChatClient _chatClient;
-    private readonly EmbeddingClient _embeddingClient;
+    private readonly OllamaApiClient _ollama;
     private readonly string _policyPath;
     private readonly string _dbPath;
 
+    private const string ChatModel = "llama3.2";
+    private const string EmbedModel = "nomic-embed-text";
+
     public PolicyService(IConfiguration config)
     {
-        var apiKey = config["OpenAi:ApiKey"];
-        
-        if (string.IsNullOrEmpty(apiKey))
-        {
-            throw new InvalidOperationException("Missing required Api Key!");
-        }
-        
-        var client = new OpenAIClient(apiKey);
-
-        _chatClient = client.GetChatClient("gpt-4o-mini");
-        _embeddingClient = client.GetEmbeddingClient("text-embedding-3-small");
+        _ollama = new OllamaApiClient("http://localhost:11434");
 
         _policyPath = Path.Combine(Directory.GetCurrentDirectory(), "Data", "return_policy.txt");
         _dbPath = Path.Combine(Directory.GetCurrentDirectory(), "Data", "embeddings.db");
-        
+
         InitializeDatabase();
         LoadPolicyIntoDatabaseAsync().GetAwaiter().GetResult();
     }
@@ -50,8 +41,8 @@ public class PolicyService
     private async Task LoadPolicyIntoDatabaseAsync()
     {
         var policyText = await File.ReadAllTextAsync(_policyPath);
-        var chunks = SplitIntoChunks(policyText, 500);
-        
+        var chunks = SplitIntoChunks(policyText, 500).ToList();
+
         using var conn = new SqliteConnection($"Data Source={_dbPath}");
         conn.Open();
 
@@ -60,25 +51,24 @@ public class PolicyService
             var checkCmd = conn.CreateCommand();
             checkCmd.CommandText = "SELECT COUNT(*) FROM PolicyChunks WHERE Text = $text";
             checkCmd.Parameters.AddWithValue("$text", chunk);
-
             bool exists = Convert.ToInt32(checkCmd.ExecuteScalar()) > 0;
-
             if (exists) continue;
 
             try
             {
-                var embeddingResult = await _embeddingClient.GenerateEmbeddingAsync(chunk);
+                var embedResponse = await _ollama.EmbedAsync(new EmbedRequest
+                {
+                    Model = EmbedModel,
+                    Input = [chunk]
+                });
 
-                float[] vector = embeddingResult.Value.ToFloats().ToArray();
+                float[] vector = embedResponse.Embeddings[0];
 
-                var insertComand = conn.CreateCommand();
-                
-                insertComand.CommandText = "INSERT INTO PolicyChunks (Text, Embedding) VALUES ($text, $embedding)";
-
-                insertComand.Parameters.AddWithValue("$text", chunk);
-                insertComand.Parameters.AddWithValue("$embedding", FloatArrayToBytes(vector));
-
-                insertComand.ExecuteNonQuery();
+                var insertCmd = conn.CreateCommand();
+                insertCmd.CommandText = "INSERT INTO PolicyChunks (Text, Embedding) VALUES ($text, $embedding)";
+                insertCmd.Parameters.AddWithValue("$text", chunk);
+                insertCmd.Parameters.AddWithValue("$embedding", FloatArrayToBytes(vector));
+                insertCmd.ExecuteNonQuery();
             }
             catch (Exception e)
             {
@@ -89,23 +79,32 @@ public class PolicyService
 
     public async Task<string> GetAnswerAsync(string question)
     {
-        var queryEmbedding = await _embeddingClient.GenerateEmbeddingAsync(question);
-        var queryVector = queryEmbedding.Value.ToFloats().ToArray();
+        var embedResponse = await _ollama.EmbedAsync(new EmbedRequest
+        {
+            Model = EmbedModel,
+            Input = [question]
+        });
 
+        var queryVector = embedResponse.Embeddings[0];
         var topChunks = GetTopChunks(queryVector, 3);
-
         var context = string.Join("\n\n", topChunks);
 
-        List<ChatMessage> messages = new()
-        {
-            ChatMessage.CreateSystemMessage(
-                "You are a helpful assistant that answers based on company return policies."),
-            ChatMessage.CreateUserMessage(
-                $"Use only the following policy text to answer the question:\n\n{context}\n\nQuestion: {question}")
-        };
+        var prompt = $"Use only the following policy text to answer the question:\n\n{context}\n\nQuestion: {question}";
 
-        var response = await _chatClient.CompleteChatAsync(messages);
-        return response.Value.Content[0].Text.Trim();
+        var fullResponse = "";
+
+        await foreach (var chunk in _ollama.GenerateAsync(new GenerateRequest
+        {
+            Model = ChatModel,
+            Prompt = prompt,
+            System = "You are a helpful assistant that answers based on company return policies.",
+            Stream = true
+        }))
+        {
+            fullResponse += chunk?.Response ?? "";
+        }
+
+        return fullResponse.Trim();
     }
 
     private List<string> GetTopChunks(float[] queryEmbedding, int topN)
@@ -117,7 +116,6 @@ public class PolicyService
         selectCmd.CommandText = "SELECT Text, Embedding FROM PolicyChunks";
 
         using var reader = selectCmd.ExecuteReader();
-        
         var scoredChunks = new List<(string Text, double Score)>();
 
         while (reader.Read())
@@ -125,7 +123,6 @@ public class PolicyService
             var text = reader.GetString(0);
             var embeddingBytes = (byte[])reader["Embedding"];
             var embedding = BytesToFloatArray(embeddingBytes);
-
             var similarity = CosineSimilarity(embedding, queryEmbedding);
             scoredChunks.Add((text, similarity));
         }
@@ -136,7 +133,7 @@ public class PolicyService
             .Select(x => x.Text)
             .ToList();
     }
-    
+
     private static IEnumerable<string> SplitIntoChunks(string text, int maxLength)
     {
         for (int i = 0; i < text.Length; i += maxLength)
@@ -154,7 +151,7 @@ public class PolicyService
         }
         return dot / (Math.Sqrt(mag1) * Math.Sqrt(mag2));
     }
-    
+
     private static byte[] FloatArrayToBytes(float[] array)
     {
         var bytes = new byte[array.Length * sizeof(float)];
@@ -165,7 +162,6 @@ public class PolicyService
     private static float[] BytesToFloatArray(byte[] bytes)
     {
         var floats = new float[bytes.Length / sizeof(float)];
-    
         Buffer.BlockCopy(bytes, 0, floats, 0, bytes.Length);
         return floats;
     }
