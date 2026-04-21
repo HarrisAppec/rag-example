@@ -1,0 +1,22 @@
+# Sensitive config
+appsettings.Development.json
+appsettings.*.json
+!appsettings.json
+
+# Build output
+bin/
+obj/
+
+# .NET
+*.user
+*.suo
+.vs/
+.idea/
+*.DotSettings.user
+
+# Rider / JetBrains
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

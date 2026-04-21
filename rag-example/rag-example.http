@@ -1,0 +1,6 @@
+@rag_example_HostAddress = http://localhost:5134
+
+GET {{rag_example_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
