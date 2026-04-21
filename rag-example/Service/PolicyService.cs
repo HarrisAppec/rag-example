@@ -1,4 +1,3 @@
-using System.Net.Mime;
 using Microsoft.Data.Sqlite;
 using OpenAI;
 using OpenAI.Chat;
@@ -31,7 +30,7 @@ public class PolicyService
         _dbPath = Path.Combine(Directory.GetCurrentDirectory(), "Data", "embeddings.db");
         
         InitializeDatabase();
-        LoadPolicyIntoDatabaseAsync().Wait();
+        LoadPolicyIntoDatabaseAsync().GetAwaiter().GetResult();
     }
 
     private void InitializeDatabase()
@@ -59,12 +58,12 @@ public class PolicyService
         foreach (var chunk in chunks)
         {
             var checkCmd = conn.CreateCommand();
-            
             checkCmd.CommandText = "SELECT COUNT(*) FROM PolicyChunks WHERE Text = $text";
+            checkCmd.Parameters.AddWithValue("$text", chunk);
 
             bool exists = Convert.ToInt32(checkCmd.ExecuteScalar()) > 0;
-            
-            if (!exists) continue;
+
+            if (exists) continue;
 
             try
             {
